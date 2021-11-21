@@ -227,9 +227,7 @@ func main() {
 		println("failed to restore data: ", err.Error())
 		return
 	}
-	if Options.verbose {
-		debug("Restored ", ht.Size(), " elements")
-	}
+	fmt.Println("[SERVER] Restored ", ht.Size(), " elements")
 
 	listener, err := net.Listen("tcp", fmt.Sprint("127.0.0.1:", Options.port))
 	if err != nil {

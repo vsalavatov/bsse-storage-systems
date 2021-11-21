@@ -5,12 +5,14 @@ import (
 	"io"
 	"os"
 	"path"
+	"time"
 )
 
 const kInitSize = 64
 const kMaxLoadFactor = 0.75
 const kScaleFactor = 1.66
 const kMaxRecordsPerLogFile = 256 * 1024 * 1024 / KeyValueSize // about 256 MiB per log file
+const kSyncPeriod = 1 * time.Second
 
 type htNode struct {
 	KeyValue
@@ -30,10 +32,11 @@ type persistentHashTable struct {
 	elements uint64
 	hasher   Hasher
 
-	logDir             string
-	currentFile        *os.File
-	currentFileIndex   uint64
-	currentFileRecords uint64
+	logDir              string
+	currentFile         *os.File
+	currentFileIndex    uint64
+	currentFileRecords  uint64
+	currentFileLastSync time.Time
 }
 
 func NewPersistentHashTable(hasher Hasher, logDir string) PersistentHashTable {
@@ -45,6 +48,7 @@ func NewPersistentHashTable(hasher Hasher, logDir string) PersistentHashTable {
 		currentFile:        nil,
 		currentFileIndex:   0,
 		currentFileRecords: 0,
+		currentFileLastSync: time.Time{},
 	}
 	return ht
 }
@@ -58,6 +62,7 @@ func (ht *persistentHashTable) Free() error {
 		ht.currentFile = nil
 		ht.currentFileIndex = 0
 		ht.currentFileRecords = 0
+		ht.currentFileLastSync = time.Time{}
 	}
 	ht.elements = 0
 	ht.data = make([]htNode, kInitSize)
@@ -104,6 +109,7 @@ func (ht *persistentHashTable) Restore() error {
 		ht.currentFileIndex += 1
 		ht.currentFileRecords = 0
 	}
+	ht.currentFileLastSync = time.Now()
 	return nil
 }
 
@@ -145,6 +151,10 @@ func (ht *persistentHashTable) putNoLog(key Key, value Value) {
 func (ht *persistentHashTable) doLog(key Key, value Value) error {
 	var err error
 	if ht.currentFileRecords == kMaxRecordsPerLogFile {
+		err = ht.currentFile.Sync()
+		if err != nil {
+			return err
+		}
 		err = ht.currentFile.Close()
 		if err != nil {
 			return err
@@ -165,6 +175,13 @@ func (ht *persistentHashTable) doLog(key Key, value Value) error {
 	_, err = ht.currentFile.Write(buf[:])
 	if err != nil {
 		return err
+	}
+	if ht.currentFileLastSync.Add(kSyncPeriod).Before(time.Now()) {
+		err = ht.currentFile.Sync()
+		if err != nil {
+			return err
+		}
+		ht.currentFileLastSync = time.Now()
 	}
 	ht.currentFileRecords += 1
 	return nil
