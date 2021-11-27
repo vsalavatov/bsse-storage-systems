@@ -13,34 +13,33 @@ type Value = uint64
 type Hasher = func(Key) uint64
 
 type KeyValue struct {
-	key   Key
-	value Value
+	Key
+	Value
 }
 type KeyValueBuffer = [KeyValueSize]byte
 
 func (kv *KeyValue) serialize(buf *KeyValueBuffer) {
-	copy(buf[:KeySize], kv.key[:])
+	copy(buf[:KeySize], kv.Key[:])
 	for i := 0; i < 8; i++ {
-		buf[KeySize+i] = byte((kv.value >> (i * 8)) & 0xff)
+		buf[KeySize+i] = byte((kv.Value >> (i * 8)) & 0xff)
 	}
 }
 
 func (kv *KeyValue) deserialize(buf *KeyValueBuffer) {
-	copy(kv.key[:], buf[:KeySize])
-	kv.value = 0
+	copy(kv.Key[:], buf[:KeySize])
+	kv.Value = 0
 	for i := 0; i < 8; i++ {
-		kv.value |= uint64(buf[KeySize + i]) << (i * 8)
+		kv.Value |= uint64(buf[KeySize+i]) << (i * 8)
 	}
 }
 
-
 var (
-	KeyNotFoundError = fmt.Errorf("key not found")
+	KeyNotFoundError = fmt.Errorf("Key not found")
 )
 
 type HashTable interface {
-	Put(key Key, value Value) error
-	Get(key Key) (Value, error)
+	Put(key Key, value Value, callback func(error))
+	Get(key Key, callback func(Value, error))
 
 	Size() uint64
 }

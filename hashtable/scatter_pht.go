@@ -1,6 +1,7 @@
 package hashtable
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -8,8 +9,7 @@ import (
 )
 
 type scatterPHT struct {
-	phts    []PersistentHashTable
-	mutexes []sync.Mutex
+	phts []PersistentHashTable
 
 	hasher       Hasher
 	commonLogDir string
@@ -19,10 +19,9 @@ type scatterPHT struct {
 	scatterMask uint64
 }
 
-func NewScatterPHT(scatterBits int, hasher Hasher, logDir string) PersistentHashTable {
+func NewScatterPHT(ctx context.Context, scatterBits int, hasher Hasher, logDir string) PersistentHashTable {
 	instance := &scatterPHT{
 		phts:         nil,
-		mutexes:      nil,
 		commonLogDir: logDir,
 		hasher:       hasher,
 		scatterBits:  scatterBits,
@@ -31,7 +30,6 @@ func NewScatterPHT(scatterBits int, hasher Hasher, logDir string) PersistentHash
 	}
 
 	instance.phts = make([]PersistentHashTable, instance.scatterSize)
-	instance.mutexes = make([]sync.Mutex, instance.scatterSize)
 
 	subHasher := func(key Key) uint64 {
 		value := instance.hasher(key)
@@ -42,23 +40,19 @@ func NewScatterPHT(scatterBits int, hasher Hasher, logDir string) PersistentHash
 	for i := 0; i < instance.scatterSize; i++ {
 		logPath := path.Join(instance.commonLogDir, fmt.Sprintf(fmtStr, i))
 		os.MkdirAll(logPath, 0744)
-		instance.phts[i] = NewPersistentHashTable(subHasher, logPath)
+		instance.phts[i] = NewPersistentHashTable(ctx, subHasher, logPath)
 	}
 	return instance
 }
 
-func (s *scatterPHT) Put(key Key, value Value) error {
+func (s *scatterPHT) Put(key Key, value Value, callback func(error)) {
 	h := s.hasher(key) & s.scatterMask
-	s.mutexes[h].Lock()
-	defer s.mutexes[h].Unlock()
-	return s.phts[h].Put(key, value)
+	s.phts[h].Put(key, value, callback)
 }
 
-func (s *scatterPHT) Get(key Key) (Value, error) {
+func (s *scatterPHT) Get(key Key, callback func(Value, error)) {
 	h := s.hasher(key) & s.scatterMask
-	s.mutexes[h].Lock()
-	defer s.mutexes[h].Unlock()
-	return s.phts[h].Get(key)
+	s.phts[h].Get(key, callback)
 }
 
 func (s *scatterPHT) Size() uint64 { // estimated
@@ -70,13 +64,19 @@ func (s *scatterPHT) Size() uint64 { // estimated
 }
 
 func (s *scatterPHT) Restore() error {
-	for i := 0; i < s.scatterSize; i++ {
-		s.mutexes[i].Lock()
+	var wg sync.WaitGroup
+	wg.Add(s.scatterSize)
+	var errr error = nil
+	restf := func(i int) {
+		defer wg.Done()
 		err := s.phts[i].Restore()
-		s.mutexes[i].Unlock()
 		if err != nil {
-			return err
+			errr = err
 		}
 	}
-	return nil
+	for i := 0; i < s.scatterSize; i++ {
+		go restf(i)
+	}
+	wg.Wait()
+	return errr
 }

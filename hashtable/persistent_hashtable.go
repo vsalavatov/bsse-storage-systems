@@ -1,27 +1,44 @@
 package hashtable
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path"
-	"time"
 )
 
 const kInitSize = 64
 const kMaxLoadFactor = 0.75
 const kScaleFactor = 1.66
 const kMaxRecordsPerLogFile = 256 * 1024 * 1024 / KeyValueSize // about 256 MiB per log file
-const kSyncPeriod = 1 * time.Second
+const kRequestsBufferSize = 512
+
+type PersistentHashTable interface {
+	HashTable
+	Restore() error
+}
 
 type htNode struct {
 	KeyValue
 	isOccupied bool
 }
 
-type PersistentHashTable interface {
-	HashTable
-	Restore() error
+const (
+	kPUT = iota
+	kGET
+)
+
+type htRequest struct {
+	reqType  uint8
+	key      Key
+	value    Value
+	callback func(Value, error)
+}
+
+type htResponse struct {
+	value Value
+	err   error
 }
 
 // persistentHashTable
@@ -32,14 +49,16 @@ type persistentHashTable struct {
 	elements uint64
 	hasher   Hasher
 
-	logDir              string
-	currentFile         *os.File
-	currentFileIndex    uint64
-	currentFileRecords  uint64
-	currentFileLastSync time.Time
+	logDir             string
+	currentFile        *os.File
+	currentFileIndex   uint64
+	currentFileRecords uint64
+
+	requests chan htRequest
+	ctx      context.Context
 }
 
-func NewPersistentHashTable(hasher Hasher, logDir string) PersistentHashTable {
+func NewPersistentHashTable(ctx context.Context, hasher Hasher, logDir string) PersistentHashTable {
 	ht := &persistentHashTable{
 		data:               make([]htNode, kInitSize),
 		elements:           0,
@@ -48,25 +67,53 @@ func NewPersistentHashTable(hasher Hasher, logDir string) PersistentHashTable {
 		currentFile:        nil,
 		currentFileIndex:   0,
 		currentFileRecords: 0,
-		currentFileLastSync: time.Time{},
+		requests:           make(chan htRequest, kRequestsBufferSize),
+		ctx:                ctx,
 	}
+	go ht.run()
 	return ht
 }
 
-func (ht *persistentHashTable) Free() error {
-	if ht.currentFile != nil {
-		err := ht.currentFile.Close()
-		if err != nil {
-			return err
+func (ht *persistentHashTable) run() {
+	for {
+		select {
+		case <-ht.ctx.Done():
+			return
+		case req := <-ht.requests:
+			requests := make([]htRequest, 0, kRequestsBufferSize)
+			requests = append(requests, req)
+			for len(requests) < kRequestsBufferSize { // read all available requests
+				select {
+				case req := <-ht.requests:
+					requests = append(requests, req)
+				default:
+					goto doRequests
+				}
+			}
+		doRequests:
+			responses := make([]htResponse, len(requests))
+			anyPut := false
+			for i := 0; i < len(requests); i++ {
+				switch requests[i].reqType {
+				case kPUT:
+					responses[i].err = ht.doPut(requests[i].key, requests[i].value)
+					anyPut = true
+				case kGET:
+					responses[i].value, responses[i].err = ht.doGet(requests[i].key)
+				default:
+					panic(fmt.Sprint("unexpected persistent hashtable request type:", requests[i].reqType))
+				}
+			}
+			if anyPut && ht.currentFile != nil {
+				if err := ht.currentFile.Sync(); err != nil {
+					panic(err)
+				}
+			}
+			for i := 0; i < len(requests); i++ {
+				requests[i].callback(responses[i].value, responses[i].err)
+			}
 		}
-		ht.currentFile = nil
-		ht.currentFileIndex = 0
-		ht.currentFileRecords = 0
-		ht.currentFileLastSync = time.Time{}
 	}
-	ht.elements = 0
-	ht.data = make([]htNode, kInitSize)
-	return nil
 }
 
 func (ht *persistentHashTable) makeLogName(index uint64) string {
@@ -75,10 +122,6 @@ func (ht *persistentHashTable) makeLogName(index uint64) string {
 
 // Restore -- reads the state from the disk
 func (ht *persistentHashTable) Restore() error {
-	err := ht.Free()
-	if err != nil {
-		return err
-	}
 	for {
 		logFileName := ht.makeLogName(ht.currentFileIndex)
 		currentFile, err := os.OpenFile(logFileName, os.O_RDWR, 0644)
@@ -96,7 +139,7 @@ func (ht *persistentHashTable) Restore() error {
 				break
 			}
 			record.deserialize(&buffer)
-			ht.putNoLog(record.key, record.value)
+			ht.putNoLog(record.Key, record.Value)
 			ht.currentFileRecords += 1
 		}
 		if ht.currentFileRecords < kMaxRecordsPerLogFile {
@@ -109,14 +152,13 @@ func (ht *persistentHashTable) Restore() error {
 		ht.currentFileIndex += 1
 		ht.currentFileRecords = 0
 	}
-	ht.currentFileLastSync = time.Now()
 	return nil
 }
 
 func (ht *persistentHashTable) findSlot(key Key, data []htNode) uint64 {
 	h := ht.hasher(key) % uint64(len(data))
 	for data[h].isOccupied {
-		if data[h].key == key {
+		if data[h].Key == key {
 			return h
 		}
 		h += 1
@@ -131,7 +173,7 @@ func (ht *persistentHashTable) extend() {
 	newData := make([]htNode, int(float64(len(ht.data))*kScaleFactor))
 	for _, node := range ht.data {
 		if node.isOccupied {
-			newData[ht.findSlot(node.key, newData)] = node
+			newData[ht.findSlot(node.Key, newData)] = node
 		}
 	}
 	ht.data = newData
@@ -176,18 +218,11 @@ func (ht *persistentHashTable) doLog(key Key, value Value) error {
 	if err != nil {
 		return err
 	}
-	if ht.currentFileLastSync.Add(kSyncPeriod).Before(time.Now()) {
-		err = ht.currentFile.Sync()
-		if err != nil {
-			return err
-		}
-		ht.currentFileLastSync = time.Now()
-	}
 	ht.currentFileRecords += 1
 	return nil
 }
 
-func (ht *persistentHashTable) Put(key Key, value Value) error {
+func (ht *persistentHashTable) doPut(key Key, value Value) error {
 	var err error
 	err = ht.doLog(key, value)
 	if err != nil {
@@ -197,14 +232,33 @@ func (ht *persistentHashTable) Put(key Key, value Value) error {
 	return nil
 }
 
-func (ht *persistentHashTable) Get(key Key) (Value, error) {
+func (ht *persistentHashTable) doGet(key Key) (Value, error) {
 	slot := ht.findSlot(key, ht.data)
-	if ht.data[slot].isOccupied && ht.data[slot].key == key {
-		return ht.data[slot].value, nil
+	if ht.data[slot].isOccupied && ht.data[slot].Key == key {
+		return ht.data[slot].Value, nil
 	}
 	return 0, KeyNotFoundError
 }
 
 func (ht *persistentHashTable) Size() uint64 {
 	return ht.elements
+}
+
+func (ht *persistentHashTable) Put(key Key, value Value, callback func(error)) {
+	ht.requests <- htRequest{
+		reqType: kPUT,
+		key:     key,
+		value:   value,
+		callback: func(_ Value, err error) {
+			callback(err)
+		},
+	}
+}
+
+func (ht *persistentHashTable) Get(key Key, callback func(Value, error)) {
+	ht.requests <- htRequest{
+		reqType:  kGET,
+		key:      key,
+		callback: callback,
+	}
 }
