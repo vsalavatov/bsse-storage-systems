@@ -165,21 +165,21 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 					}
 					var keyBuf [hashtable.KeySize]byte
 					copy(keyBuf[:], getReq.Key)
-					ht.Get(keyBuf, func(value hashtable.Value, err error) {
+					ht.Get(keyBuf, func(offset hashtable.Offset, err error) {
 						if err != nil && err != hashtable.KeyNotFoundError {
-							logErr(conn, "hash table has failed to get value of", getReq.Key, ":", err.Error())
+							logErr(conn, "hash table has failed to get offset of", getReq.Key, ":", err.Error())
 							return
 						}
 						if Options.verbose && err == hashtable.KeyNotFoundError {
-							logErr(conn, "hash table has no value for key ", getReq.Key)
+							logErr(conn, "hash table has no offset for key ", getReq.Key)
 						}
-						buf, err := proto.Marshal(&protocol.TGetResponse{RequestId: getReq.RequestId, Offset: value})
+						buf, err := proto.Marshal(&protocol.TGetResponse{RequestId: getReq.RequestId, Offset: offset})
 						if err != nil {
 							logErr(conn, "failed to marshal get response message:", err.Error())
 							return
 						}
 						if Options.verbose {
-							debug("#", getReq.RequestId, " ! GET ", getReq.Key, " offset=", value)
+							debug("#", getReq.RequestId, " ! GET ", getReq.Key, " offset=", offset)
 						}
 						responses <- Message{GET_RESPONSE, buf}
 					})

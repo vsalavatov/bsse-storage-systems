@@ -32,13 +32,13 @@ const (
 type htRequest struct {
 	reqType  uint8
 	key      Key
-	value    Value
-	callback func(Value, error)
+	offset   Offset
+	callback func(Offset, error)
 }
 
 type htResponse struct {
-	value Value
-	err   error
+	offset Offset
+	err    error
 }
 
 // persistentHashTable
@@ -96,10 +96,10 @@ func (ht *persistentHashTable) run() {
 			for i := 0; i < len(requests); i++ {
 				switch requests[i].reqType {
 				case kPUT:
-					responses[i].err = ht.doPut(requests[i].key, requests[i].value)
+					responses[i].err = ht.doPut(requests[i].key, requests[i].offset)
 					anyPut = true
 				case kGET:
-					responses[i].value, responses[i].err = ht.doGet(requests[i].key)
+					responses[i].offset, responses[i].err = ht.doGet(requests[i].key)
 				default:
 					panic(fmt.Sprint("unexpected persistent hashtable request type:", requests[i].reqType))
 				}
@@ -110,7 +110,7 @@ func (ht *persistentHashTable) run() {
 				}
 			}
 			for i := 0; i < len(requests); i++ {
-				requests[i].callback(responses[i].value, responses[i].err)
+				requests[i].callback(responses[i].offset, responses[i].err)
 			}
 		}
 	}
@@ -139,7 +139,7 @@ func (ht *persistentHashTable) Restore() error {
 				break
 			}
 			record.deserialize(&buffer)
-			ht.putNoLog(record.Key, record.Value)
+			ht.putNoLog(record.Key, record.Offset)
 			ht.currentFileRecords += 1
 		}
 		if ht.currentFileRecords < kMaxRecordsPerLogFile {
@@ -179,7 +179,7 @@ func (ht *persistentHashTable) extend() {
 	ht.data = newData
 }
 
-func (ht *persistentHashTable) putNoLog(key Key, value Value) {
+func (ht *persistentHashTable) putNoLog(key Key, offset Offset) {
 	if float64(len(ht.data))*kMaxLoadFactor <= float64(ht.elements) {
 		ht.extend()
 	}
@@ -187,10 +187,10 @@ func (ht *persistentHashTable) putNoLog(key Key, value Value) {
 	if !ht.data[slot].isOccupied {
 		ht.elements += 1
 	}
-	ht.data[slot] = htNode{KeyValue{key, value}, true}
+	ht.data[slot] = htNode{KeyValue{key, offset}, true}
 }
 
-func (ht *persistentHashTable) doLog(key Key, value Value) error {
+func (ht *persistentHashTable) doLog(key Key, offset Offset) error {
 	var err error
 	if ht.currentFileRecords == kMaxRecordsPerLogFile {
 		err = ht.currentFile.Sync()
@@ -212,7 +212,7 @@ func (ht *persistentHashTable) doLog(key Key, value Value) error {
 		}
 	}
 	var buf KeyValueBuffer
-	keyValue := KeyValue{key, value}
+	keyValue := KeyValue{key, offset}
 	keyValue.serialize(&buf)
 	_, err = ht.currentFile.Write(buf[:])
 	if err != nil {
@@ -222,20 +222,20 @@ func (ht *persistentHashTable) doLog(key Key, value Value) error {
 	return nil
 }
 
-func (ht *persistentHashTable) doPut(key Key, value Value) error {
+func (ht *persistentHashTable) doPut(key Key, offset Offset) error {
 	var err error
-	err = ht.doLog(key, value)
+	err = ht.doLog(key, offset)
 	if err != nil {
 		return err
 	}
-	ht.putNoLog(key, value)
+	ht.putNoLog(key, offset)
 	return nil
 }
 
-func (ht *persistentHashTable) doGet(key Key) (Value, error) {
+func (ht *persistentHashTable) doGet(key Key) (Offset, error) {
 	slot := ht.findSlot(key, ht.data)
 	if ht.data[slot].isOccupied && ht.data[slot].Key == key {
-		return ht.data[slot].Value, nil
+		return ht.data[slot].Offset, nil
 	}
 	return 0, KeyNotFoundError
 }
@@ -244,18 +244,18 @@ func (ht *persistentHashTable) Size() uint64 {
 	return ht.elements
 }
 
-func (ht *persistentHashTable) Put(key Key, value Value, callback func(error)) {
+func (ht *persistentHashTable) Put(key Key, offset Offset, callback func(error)) {
 	ht.requests <- htRequest{
 		reqType: kPUT,
 		key:     key,
-		value:   value,
-		callback: func(_ Value, err error) {
+		offset:  offset,
+		callback: func(_ Offset, err error) {
 			callback(err)
 		},
 	}
 }
 
-func (ht *persistentHashTable) Get(key Key, callback func(Value, error)) {
+func (ht *persistentHashTable) Get(key Key, callback func(Offset, error)) {
 	ht.requests <- htRequest{
 		reqType:  kGET,
 		key:      key,

@@ -32,8 +32,8 @@ func NewScatterPHT(ctx context.Context, scatterBits int, hasher Hasher, logDir s
 	instance.phts = make([]PersistentHashTable, instance.scatterSize)
 
 	subHasher := func(key Key) uint64 {
-		value := instance.hasher(key)
-		return value >> instance.scatterBits
+		offset := instance.hasher(key)
+		return offset >> instance.scatterBits
 	}
 	scatterHex := (scatterBits + 3) / 4
 	fmtStr := fmt.Sprint("%0", scatterHex, "x")
@@ -45,12 +45,12 @@ func NewScatterPHT(ctx context.Context, scatterBits int, hasher Hasher, logDir s
 	return instance
 }
 
-func (s *scatterPHT) Put(key Key, value Value, callback func(error)) {
+func (s *scatterPHT) Put(key Key, offset Offset, callback func(error)) {
 	h := s.hasher(key) & s.scatterMask
-	s.phts[h].Put(key, value, callback)
+	s.phts[h].Put(key, offset, callback)
 }
 
-func (s *scatterPHT) Get(key Key, callback func(Value, error)) {
+func (s *scatterPHT) Get(key Key, callback func(Offset, error)) {
 	h := s.hasher(key) & s.scatterMask
 	s.phts[h].Get(key, callback)
 }
