@@ -5,27 +5,27 @@ import (
 )
 
 const KeySize = 128
-const KeyValueSize = KeySize + 8
+const KeyOffsetSize = KeySize + 8
 
 type Key = [KeySize]byte
 type Offset = uint64
 
 type Hasher = func(Key) uint64
 
-type KeyValue struct {
+type KeyOffset struct {
 	Key
 	Offset
 }
-type KeyValueBuffer = [KeyValueSize]byte
+type KeyOffsetBuffer = [KeyOffsetSize]byte
 
-func (kv *KeyValue) serialize(buf *KeyValueBuffer) {
+func (kv *KeyOffset) serialize(buf *KeyOffsetBuffer) {
 	copy(buf[:KeySize], kv.Key[:])
 	for i := 0; i < 8; i++ {
 		buf[KeySize+i] = byte((kv.Offset >> (i * 8)) & 0xff)
 	}
 }
 
-func (kv *KeyValue) deserialize(buf *KeyValueBuffer) {
+func (kv *KeyOffset) deserialize(buf *KeyOffsetBuffer) {
 	copy(kv.Key[:], buf[:KeySize])
 	kv.Offset = 0
 	for i := 0; i < 8; i++ {

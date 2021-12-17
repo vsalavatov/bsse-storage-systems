@@ -11,7 +11,7 @@ import (
 const kInitSize = 64
 const kMaxLoadFactor = 0.75
 const kScaleFactor = 1.66
-const kMaxRecordsPerLogFile = 256 * 1024 * 1024 / KeyValueSize // about 256 MiB per log file
+const kMaxRecordsPerLogFile = 256 * 1024 * 1024 / KeyOffsetSize // about 256 MiB per log file
 const kRequestsBufferSize = 512
 
 type PersistentHashTable interface {
@@ -20,7 +20,7 @@ type PersistentHashTable interface {
 }
 
 type htNode struct {
-	KeyValue
+	KeyOffset
 	isOccupied bool
 }
 
@@ -43,7 +43,6 @@ type htResponse struct {
 
 // persistentHashTable
 // stores the sequence of put operations in log files in the logDir folder;
-// not thread safe
 type persistentHashTable struct {
 	data     []htNode
 	elements uint64
@@ -131,8 +130,8 @@ func (ht *persistentHashTable) Restore() error {
 			}
 			return err
 		}
-		var buffer KeyValueBuffer
-		var record KeyValue
+		var buffer KeyOffsetBuffer
+		var record KeyOffset
 		for {
 			_, err = currentFile.Read(buffer[:])
 			if err == io.EOF {
@@ -187,7 +186,7 @@ func (ht *persistentHashTable) putNoLog(key Key, offset Offset) {
 	if !ht.data[slot].isOccupied {
 		ht.elements += 1
 	}
-	ht.data[slot] = htNode{KeyValue{key, offset}, true}
+	ht.data[slot] = htNode{KeyOffset{key, offset}, true}
 }
 
 func (ht *persistentHashTable) doLog(key Key, offset Offset) error {
@@ -211,9 +210,9 @@ func (ht *persistentHashTable) doLog(key Key, offset Offset) error {
 			return err
 		}
 	}
-	var buf KeyValueBuffer
-	keyValue := KeyValue{key, offset}
-	keyValue.serialize(&buf)
+	var buf KeyOffsetBuffer
+	keyOffset := KeyOffset{key, offset}
+	keyOffset.serialize(&buf)
 	_, err = ht.currentFile.Write(buf[:])
 	if err != nil {
 		return err
