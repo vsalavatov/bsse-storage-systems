@@ -7,29 +7,33 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/spaolacci/murmur3"
 	"github.com/vsalavatov/bsse-storage-systems/hashtable"
+	"github.com/vsalavatov/bsse-storage-systems/keyvalue"
 	"github.com/vsalavatov/bsse-storage-systems/protocol"
 	"io"
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
+	"path"
 	"sync"
 	"time"
 )
 
 const (
-	kRequestsBufferSize = 4096
+	kRequestsBufferSize = 128
+	kMaxMessageSize     = keyvalue.MaxValueSize + 16*1024 // 4 MiB + 16 KiB for key and header
 )
 
 var Options struct {
-	port        int
-	logsDir     string
-	verbose     bool
-	maxConns    int
-	scatterBits int
+	port           int
+	logsDir        string
+	verbose        bool
+	maxConns       int
+	htScatterBits  int
+	kvsScatterBits int
 }
 
 var ht hashtable.PersistentHashTable
+var kvs keyvalue.KeyValueStorage
 
 const (
 	PUT_REQUEST  = 1
@@ -68,6 +72,9 @@ func readMessage(conn net.Conn) (Message, error) {
 	length := uint32(0)
 	for i := 0; i < 4; i++ {
 		length |= uint32(header[i+1]) << (i * 8)
+	}
+	if length > kMaxMessageSize {
+		return Message{}, fmt.Errorf("message value is too big")
 	}
 	buf := make([]byte, length)
 	toRead := length
@@ -134,13 +141,13 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 						return
 					}
 					if Options.verbose {
-						debug("#", putReq.RequestId, " ? PUT ", putReq.Key, "=", putReq.Offset)
+						debug("#", putReq.RequestId, " ? PUT ", putReq.Key, "=", putReq.GetValue())
 					}
 					var keyBuf [hashtable.KeySize]byte
 					copy(keyBuf[:], putReq.Key)
-					ht.Put(keyBuf, putReq.Offset, func(err error) {
+					kvs.Put(keyBuf, putReq.Value, func(err error) {
 						if err != nil {
-							logErr(conn, "hash table has failed to put ", putReq.Key, "->", strconv.FormatUint(putReq.Offset, 10), err.Error())
+							logErr(conn, "kvs has failed to put ", putReq.Key, "->", string(putReq.Value), err.Error())
 							return
 						}
 						buf, err := proto.Marshal(&protocol.TPutResponse{RequestId: putReq.RequestId})
@@ -149,7 +156,7 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 							return
 						}
 						if Options.verbose {
-							debug("#", putReq.RequestId, " ! PUT ", putReq.Key, "=", putReq.Offset)
+							debug("#", putReq.RequestId, " ! PUT ", putReq.Key, "=", string(putReq.Value))
 						}
 						responses <- Message{msgType: PUT_RESPONSE, data: buf}
 					})
@@ -165,21 +172,21 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 					}
 					var keyBuf [hashtable.KeySize]byte
 					copy(keyBuf[:], getReq.Key)
-					ht.Get(keyBuf, func(offset hashtable.Offset, err error) {
+					kvs.Get(keyBuf, func(value keyvalue.Value, err error) {
 						if err != nil && err != hashtable.KeyNotFoundError {
-							logErr(conn, "hash table has failed to get offset of", getReq.Key, ":", err.Error())
+							logErr(conn, "kvs has failed to get value of", getReq.Key, ":", err.Error())
 							return
 						}
 						if Options.verbose && err == hashtable.KeyNotFoundError {
-							logErr(conn, "hash table has no offset for key ", getReq.Key)
+							logErr(conn, "kvs has no value for key ", getReq.Key)
 						}
-						buf, err := proto.Marshal(&protocol.TGetResponse{RequestId: getReq.RequestId, Offset: offset})
+						buf, err := proto.Marshal(&protocol.TGetResponse{RequestId: getReq.RequestId, Value: value})
 						if err != nil {
 							logErr(conn, "failed to marshal get response message:", err.Error())
 							return
 						}
 						if Options.verbose {
-							debug("#", getReq.RequestId, " ! GET ", getReq.Key, " offset=", offset)
+							debug("#", getReq.RequestId, " ! GET ", getReq.Key, " value=", string(value))
 						}
 						responses <- Message{GET_RESPONSE, buf}
 					})
@@ -226,7 +233,9 @@ func parseArgs() {
 	logsDir := flag.String("logs", "data", "path to the folder where data is located")
 	verbose := flag.Bool("verbose", false, "print logs")
 	maxConns := flag.Int("max-conns", 32, "maximum concurrent connections to handle")
-	scatterBits := flag.Int("scatter-bits", 6, "amount of hash bits used to scatter keys between hashtables")
+	htScatterBits := flag.Int("ht-scatter-bits", 3, "amount of hash bits used to scatter keys between hashtables")
+	kvsScatterBits := flag.Int("kvs-scatter-bits", 5, "amount of hash bits used to scatter keys between data storages")
+
 	flag.Parse()
 	if !flag.Parsed() {
 		flag.Usage()
@@ -236,7 +245,8 @@ func parseArgs() {
 	Options.logsDir = *logsDir
 	Options.verbose = *verbose
 	Options.maxConns = *maxConns
-	Options.scatterBits = *scatterBits
+	Options.htScatterBits = *htScatterBits
+	Options.kvsScatterBits = *kvsScatterBits
 }
 
 func main() {
@@ -250,7 +260,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	ht = hashtable.NewScatterPHT(ctx, Options.scatterBits, func(key hashtable.Key) uint64 {
+	ht = hashtable.NewScatterPHT(ctx, Options.htScatterBits, func(key hashtable.Key) uint64 {
 		h := murmur3.New64()
 		_, _ = h.Write(key[:])
 		result := h.Sum64()
@@ -258,12 +268,25 @@ func main() {
 			debug("hash(", key, "@", string(key[:]), ")=", result)
 		}
 		return result
-	}, Options.logsDir)
+	}, path.Join(Options.logsDir, "hashtables"))
 	if err = ht.Restore(); err != nil {
 		println("failed to restore data: ", err.Error())
 		return
 	}
-	fmt.Println("[SERVER] Restored ", ht.Size(), " elements")
+	fmt.Println("[SERVER] hashtables restored ", ht.Size(), " elements")
+	kvs, err = keyvalue.NewScatterKVS(ctx, Options.kvsScatterBits, func(key hashtable.Key) uint64 {
+		h := murmur3.New64()
+		_, _ = h.Write([]byte("salty"))
+		_, _ = h.Write(key[:])
+		result := h.Sum64()
+		if Options.verbose {
+			debug("kvs-hash(", key, "@", string(key[:]), ")=", result)
+		}
+		return result
+	}, path.Join(Options.logsDir, "data"), ht)
+	if err != nil {
+		fmt.Println("failed to initialize kvs: ", err.Error())
+	}
 
 	listener, err := net.Listen("tcp", fmt.Sprint("127.0.0.1:", Options.port))
 	if err != nil {

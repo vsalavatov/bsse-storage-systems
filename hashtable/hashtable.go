@@ -34,7 +34,7 @@ func (kv *KeyOffset) deserialize(buf *KeyOffsetBuffer) {
 }
 
 var (
-	KeyNotFoundError = fmt.Errorf("Key not found")
+	KeyNotFoundError = fmt.Errorf("key not found")
 )
 
 type HashTable interface {
