@@ -8,3 +8,4 @@ protoc:
 	mkdir -p protocol
 	protoc -I=. --go_out=. kv.proto
 
+.PHONY: all protoc protoc-plugin
