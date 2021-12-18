@@ -1,4 +1,4 @@
-all: server client
+all: server client loadtest
 
 protoc-plugin:
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
@@ -13,4 +13,7 @@ server:
 client:
 	go build cmd/client/client.go
 
-.PHONY: all protoc protoc-plugin server client
+loadtest:
+	go build cmd/loadtest/loadtest.go
+
+.PHONY: all protoc protoc-plugin server client loadtest
