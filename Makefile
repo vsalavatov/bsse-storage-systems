@@ -8,7 +8,7 @@ protoc:
 	protoc -I=. --go_out=. kv.proto
 
 server:
-	go build cmd/server/server.go
+	go build cmd/server/server.go cmd/server/io.go cmd/server/util.go
 
 client:
 	go build cmd/client/client.go

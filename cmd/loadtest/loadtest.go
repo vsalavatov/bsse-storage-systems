@@ -138,7 +138,7 @@ func makeValue(key string) []byte {
 	}
 	value := make([]byte, size)
 	for i := 0; i < size; i++ {
-		value[i] = byte(uint8(size+i+i*i+i*i*i)%26 + uint8('a'))
+		value[i] = byte(uint8(size+i+i*i+i*i*i+10)%26 + uint8('a'))
 	}
 	return value
 }
@@ -286,7 +286,7 @@ func main() {
 								return
 							}
 							for j := 0; j < len(getResp.Value); j++ {
-								expected := byte(uint8(len(getResp.Value)+j+j*j+j*j*j)%26 + uint8('a'))
+								expected := byte(uint8(len(getResp.Value)+j+j*j+j*j*j+10)%26 + uint8('a'))
 								if getResp.Value[j] != expected {
 									fmt.Println("WRONG: thread #", id, " reqId=", getResp.RequestId, " at ", j+1, " position: expected sym ", expected, " got sym ", getResp.Value[j])
 									return

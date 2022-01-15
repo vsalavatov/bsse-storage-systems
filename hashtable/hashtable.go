@@ -34,6 +34,7 @@ func NewHashTable(hasher Hasher) *HashTable {
 }
 
 func (ht *HashTable) findSlot(key Key, keyHash uint64, data []HashtableNode) uint64 {
+	keyHash %= uint64(len(data))
 	for data[keyHash].isOccupied {
 		if data[keyHash].Key == key {
 			return keyHash

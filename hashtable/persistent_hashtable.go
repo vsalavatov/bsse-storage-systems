@@ -2,6 +2,7 @@ package hashtable
 
 import (
 	"fmt"
+	"github.com/vsalavatov/bsse-storage-systems/util"
 	"io"
 	"os"
 	"path"
@@ -22,6 +23,7 @@ type PersistentHashTable struct {
 }
 
 func NewPersistentHashTable(hasher Hasher, logDir string) *PersistentHashTable {
+	util.EnsureDirExists(logDir)
 	ht := &PersistentHashTable{
 		hashtable:          NewHashTable(hasher),
 		logDir:             logDir,
@@ -38,7 +40,7 @@ func (pht *PersistentHashTable) makeLogName(index uint32) string {
 }
 
 func (pht *PersistentHashTable) makeDataName() string {
-	return path.Join(pht.logDir, fmt.Sprintf("data.bin"))
+	return path.Join(pht.logDir, "data.bin")
 }
 
 func (pht *PersistentHashTable) Hasher() Hasher {
@@ -49,7 +51,10 @@ func (pht *PersistentHashTable) Hasher() Hasher {
 func (pht *PersistentHashTable) Restore() error {
 	{ // read
 		dataFile, err := os.OpenFile(pht.makeDataName(), os.O_RDONLY, 0644)
-		if err != nil && !os.IsNotExist(err) {
+		if err != nil {
+			if os.IsNotExist(err) {
+				goto nodata
+			}
 			return err
 		}
 		defer dataFile.Close()
@@ -64,6 +69,7 @@ func (pht *PersistentHashTable) Restore() error {
 			pht.hashtable.SetMeta(record.Key, pht.hashtable.Hasher(record.Key), record.RecordMeta)
 		}
 	}
+nodata:
 	for {
 		logFileName := pht.makeLogName(pht.currentFileIndex)
 		currentFile, err := os.OpenFile(logFileName, os.O_RDWR, 0644)
@@ -99,7 +105,7 @@ func (pht *PersistentHashTable) Restore() error {
 
 // there must be no concurrent put operations until this method completes
 func (pht *PersistentHashTable) DumpAndCompact() error {
-	dataFile, err := os.OpenFile(pht.makeDataName()+".tmp", os.O_RDWR, 0644)
+	dataFile, err := os.OpenFile(pht.makeDataName()+".tmp", os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return err
 	}
