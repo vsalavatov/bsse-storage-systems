@@ -9,10 +9,17 @@ $ make
 
 ### Run instructions
 ```shell
-$ ./server 
-	[-verbose] 
-	[-port <port> (default=4242)] 
-	[-logs <path> (default=data/)] 
-	[-max-conns <number> (default=32)] 
-	[-scatter-bits <number> (default=6) -- number of parallel hash tables is 2^scatter bits]
+$ ./server
+  -ht-scatter-bits int
+    	amount of hash bits used to scatter keys between hashtables (default 3)
+  -kvs-scatter-bits int
+    	amount of hash bits used to scatter keys between data storages (default 5)
+  -logs string
+    	path to the folder where data is located (default "data")
+  -max-conns int
+    	maximum concurrent connections to handle (default 32)
+  -port int
+    	the port server will listen on (default 4242)
+  -verbose
+    	print logs
 ```
