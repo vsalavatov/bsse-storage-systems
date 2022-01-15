@@ -214,6 +214,7 @@ func main() {
 		return
 	}
 
+	go kvs.CleanerJob(ctx)
 	bp = batch.NewBatchKeyValueProcessor(ctx, kvs)
 
 	listener, err := net.Listen("tcp", fmt.Sprint("127.0.0.1:", Options.port))

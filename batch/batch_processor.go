@@ -90,6 +90,7 @@ func (bp *BatchKeyValueProcessor) run() {
 					panic(fmt.Sprint("hashtable rotation failure:", err.Error()))
 				}
 				if available {
+					fmt.Println("[BatchProcessor] triggering hashtable rotation")
 					bp.lastRotation = time.Now()
 					bp.kvs.Rotate()
 				}
