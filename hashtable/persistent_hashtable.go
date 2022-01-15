@@ -1,128 +1,71 @@
 package hashtable
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"os"
 	"path"
 )
 
-const kInitSize = 64
-const kMaxLoadFactor = 0.75
-const kScaleFactor = 1.66
-const kMaxRecordsPerLogFile = 256 * 1024 * 1024 / KeyOffsetSize // about 256 MiB per log file
-const kRequestsBufferSize = 512
+const kMaxRecordsPerLogFile = 16 * 1024 * 1024 / KeyMetaSize // about 16 MiB per log file
 
-type PersistentHashTable interface {
-	HashTable
-	Restore() error
-}
-
-type htNode struct {
-	KeyOffset
-	isOccupied bool
-}
-
-const (
-	kPUT = iota
-	kGET
-)
-
-type htRequest struct {
-	reqType  uint8
-	key      Key
-	offset   Offset
-	callback func(Offset, error)
-}
-
-type htResponse struct {
-	offset Offset
-	err    error
-}
-
-// persistentHashTable
+// PersistentHashTable
 // stores the sequence of put operations in log files in the logDir folder;
-type persistentHashTable struct {
-	data     []htNode
-	elements uint64
-	hasher   Hasher
+type PersistentHashTable struct {
+	hashtable *HashTable
 
 	logDir             string
 	currentFile        *os.File
-	currentFileIndex   uint64
+	currentFileIndex   uint32
 	currentFileRecords uint64
-
-	requests chan htRequest
-	ctx      context.Context
+	shouldSync         bool
 }
 
-func NewPersistentHashTable(ctx context.Context, hasher Hasher, logDir string) PersistentHashTable {
-	ht := &persistentHashTable{
-		data:               make([]htNode, kInitSize),
-		elements:           0,
-		hasher:             hasher,
+func NewPersistentHashTable(hasher Hasher, logDir string) *PersistentHashTable {
+	ht := &PersistentHashTable{
+		hashtable:          NewHashTable(hasher),
 		logDir:             logDir,
 		currentFile:        nil,
 		currentFileIndex:   0,
 		currentFileRecords: 0,
-		requests:           make(chan htRequest, kRequestsBufferSize),
-		ctx:                ctx,
+		shouldSync:         false,
 	}
-	go ht.run()
 	return ht
 }
 
-func (ht *persistentHashTable) run() {
-	for {
-		select {
-		case <-ht.ctx.Done():
-			return
-		case req := <-ht.requests:
-			requests := make([]htRequest, 0, kRequestsBufferSize)
-			requests = append(requests, req)
-			for len(requests) < kRequestsBufferSize { // read all available requests
-				select {
-				case req := <-ht.requests:
-					requests = append(requests, req)
-				default:
-					goto doRequests
-				}
-			}
-		doRequests:
-			responses := make([]htResponse, len(requests))
-			anyPut := false
-			for i := 0; i < len(requests); i++ {
-				switch requests[i].reqType {
-				case kPUT:
-					responses[i].err = ht.doPut(requests[i].key, requests[i].offset)
-					anyPut = true
-				case kGET:
-					responses[i].offset, responses[i].err = ht.doGet(requests[i].key)
-				default:
-					panic(fmt.Sprint("unexpected persistent hashtable request type:", requests[i].reqType))
-				}
-			}
-			if anyPut && ht.currentFile != nil {
-				if err := ht.currentFile.Sync(); err != nil {
-					panic(err)
-				}
-			}
-			for i := 0; i < len(requests); i++ {
-				requests[i].callback(responses[i].offset, responses[i].err)
-			}
-		}
-	}
+func (pht *PersistentHashTable) makeLogName(index uint32) string {
+	return path.Join(pht.logDir, fmt.Sprintf("%06d.log", index))
 }
 
-func (ht *persistentHashTable) makeLogName(index uint64) string {
-	return path.Join(ht.logDir, fmt.Sprintf("%06d.log", index))
+func (pht *PersistentHashTable) makeDataName() string {
+	return path.Join(pht.logDir, fmt.Sprintf("data.bin"))
+}
+
+func (pht *PersistentHashTable) Hasher() Hasher {
+	return pht.hashtable.Hasher
 }
 
 // Restore -- reads the state from the disk
-func (ht *persistentHashTable) Restore() error {
+func (pht *PersistentHashTable) Restore() error {
+	{ // read
+		dataFile, err := os.OpenFile(pht.makeDataName(), os.O_RDONLY, 0644)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		defer dataFile.Close()
+		var buffer KeyMetaBuffer
+		var record KeyMeta
+		for {
+			_, err = dataFile.Read(buffer[:])
+			if err == io.EOF {
+				break
+			}
+			record.deserialize(&buffer)
+			pht.hashtable.SetMeta(record.Key, pht.hashtable.Hasher(record.Key), record.RecordMeta)
+		}
+	}
 	for {
-		logFileName := ht.makeLogName(ht.currentFileIndex)
+		logFileName := pht.makeLogName(pht.currentFileIndex)
 		currentFile, err := os.OpenFile(logFileName, os.O_RDWR, 0644)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -130,134 +73,163 @@ func (ht *persistentHashTable) Restore() error {
 			}
 			return err
 		}
-		var buffer KeyOffsetBuffer
-		var record KeyOffset
+		var buffer KeyMetaBuffer
+		var record KeyMeta
 		for {
 			_, err = currentFile.Read(buffer[:])
 			if err == io.EOF {
 				break
 			}
 			record.deserialize(&buffer)
-			ht.putNoLog(record.Key, record.Offset)
-			ht.currentFileRecords += 1
+			pht.hashtable.SetMeta(record.Key, pht.hashtable.Hasher(record.Key), record.RecordMeta)
+			pht.currentFileRecords += 1
 		}
-		if ht.currentFileRecords < kMaxRecordsPerLogFile {
-			ht.currentFile = currentFile
+		if pht.currentFileRecords < kMaxRecordsPerLogFile {
+			pht.currentFile = currentFile
 			break
 		}
 		if err = currentFile.Close(); err != nil {
 			return err
 		}
-		ht.currentFileIndex += 1
-		ht.currentFileRecords = 0
+		pht.currentFileIndex += 1
+		pht.currentFileRecords = 0
 	}
 	return nil
 }
 
-func (ht *persistentHashTable) findSlot(key Key, data []htNode) uint64 {
-	h := ht.hasher(key) % uint64(len(data))
-	for data[h].isOccupied {
-		if data[h].Key == key {
-			return h
-		}
-		h += 1
-		if h == uint64(len(data)) {
-			h = 0
-		}
-	}
-	return h
-}
-
-func (ht *persistentHashTable) extend() {
-	newData := make([]htNode, int(float64(len(ht.data))*kScaleFactor))
-	for _, node := range ht.data {
-		if node.isOccupied {
-			newData[ht.findSlot(node.Key, newData)] = node
-		}
-	}
-	ht.data = newData
-}
-
-func (ht *persistentHashTable) putNoLog(key Key, offset Offset) {
-	if float64(len(ht.data))*kMaxLoadFactor <= float64(ht.elements) {
-		ht.extend()
-	}
-	slot := ht.findSlot(key, ht.data)
-	if !ht.data[slot].isOccupied {
-		ht.elements += 1
-	}
-	ht.data[slot] = htNode{KeyOffset{key, offset}, true}
-}
-
-func (ht *persistentHashTable) doLog(key Key, offset Offset) error {
-	var err error
-	if ht.currentFileRecords == kMaxRecordsPerLogFile {
-		err = ht.currentFile.Sync()
-		if err != nil {
-			return err
-		}
-		err = ht.currentFile.Close()
-		if err != nil {
-			return err
-		}
-		ht.currentFile = nil
-		ht.currentFileIndex += 1
-		ht.currentFileRecords = 0
-	}
-	if ht.currentFile == nil {
-		ht.currentFile, err = os.OpenFile(ht.makeLogName(ht.currentFileIndex), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-		if err != nil {
-			return err
-		}
-	}
-	var buf KeyOffsetBuffer
-	keyOffset := KeyOffset{key, offset}
-	keyOffset.serialize(&buf)
-	_, err = ht.currentFile.Write(buf[:])
+// there must be no concurrent put operations until this method completes
+func (pht *PersistentHashTable) DumpAndCompact() error {
+	dataFile, err := os.OpenFile(pht.makeDataName()+".tmp", os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
-	ht.currentFileRecords += 1
-	return nil
-}
-
-func (ht *persistentHashTable) doPut(key Key, offset Offset) error {
-	var err error
-	err = ht.doLog(key, offset)
+	for _, elem := range pht.hashtable.data {
+		if elem.isOccupied {
+			var buf KeyMetaBuffer
+			elem.KeyMeta.serialize(&buf)
+			_, err = dataFile.Write(buf[:])
+		}
+	}
+	err = dataFile.Sync()
 	if err != nil {
 		return err
 	}
-	ht.putNoLog(key, offset)
+	err = dataFile.Close()
+	if err != nil {
+		return err
+	}
+	err = os.Rename(pht.makeDataName()+".tmp", pht.makeDataName())
+	if err != nil { // replace old data.bin with the new one
+		return err
+	}
+	// now we can delete all log files
+	if pht.currentFile != nil {
+		err = pht.currentFile.Sync()
+		if err != nil {
+			return err
+		}
+		err = pht.currentFile.Close()
+		if err != nil {
+			return err
+		}
+		pht.currentFile = nil
+	}
+	for i := uint32(0); i <= pht.currentFileIndex; i++ {
+		err = os.Remove(pht.makeLogName(i))
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	pht.currentFileIndex = 0
+	pht.currentFileRecords = 0
+	pht.shouldSync = false
 	return nil
 }
 
-func (ht *persistentHashTable) doGet(key Key) (Offset, error) {
-	slot := ht.findSlot(key, ht.data)
-	if ht.data[slot].isOccupied && ht.data[slot].Key == key {
-		return ht.data[slot].Offset, nil
+func (pht *PersistentHashTable) writeToLog(key Key, meta RecordMeta) error {
+	err := pht.prepareForLogWrite()
+	if err != nil {
+		return err
 	}
-	return 0, KeyNotFoundError
+	var buf KeyMetaBuffer
+	keyMeta := KeyMeta{key, meta}
+	keyMeta.serialize(&buf)
+	_, err = pht.currentFile.Write(buf[:])
+	if err != nil {
+		return err
+	}
+	pht.currentFileRecords += 1
+	pht.shouldSync = true
+	return nil
 }
 
-func (ht *persistentHashTable) Size() uint64 {
-	return ht.elements
+func (pht *PersistentHashTable) prepareForLogWrite() error {
+	var err error = nil
+	if pht.currentFileRecords == kMaxRecordsPerLogFile {
+		err = pht.currentFile.Sync()
+		if err != nil {
+			return err
+		}
+		pht.shouldSync = false
+		err = pht.currentFile.Close()
+		if err != nil {
+			return err
+		}
+		pht.currentFile = nil
+		pht.currentFileIndex += 1
+		pht.currentFileRecords = 0
+	}
+	if pht.currentFile == nil {
+		pht.currentFile, err = os.OpenFile(pht.makeLogName(pht.currentFileIndex), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (ht *persistentHashTable) Put(key Key, offset Offset, callback func(error)) {
-	ht.requests <- htRequest{
-		reqType: kPUT,
-		key:     key,
-		offset:  offset,
-		callback: func(_ Offset, err error) {
-			callback(err)
-		},
-	}
+func (pht *PersistentHashTable) SetMeta(key Key, keyHash uint64, meta RecordMeta) error {
+	pht.hashtable.SetMeta(key, keyHash, meta)
+	return pht.writeToLog(key, meta)
 }
 
-func (ht *persistentHashTable) Get(key Key, callback func(Offset, error)) {
-	ht.requests <- htRequest{
-		reqType:  kGET,
-		key:      key,
-		callback: callback,
+func (pht *PersistentHashTable) SetNewLocation(key Key, keyHash uint64, location RecordLocation) (RecordMeta, error) {
+	meta := pht.hashtable.SetNewLocation(key, keyHash, location)
+	if err := pht.writeToLog(key, meta); err != nil {
+		return RecordMeta{}, err
 	}
+	return RecordMeta{}, nil
+}
+
+// returns success flag
+func (pht *PersistentHashTable) SetNewLocationForVersion(key Key, keyHash uint64, location RecordLocation, version Version) (bool, RecordMeta, error) {
+	success, meta, err := pht.hashtable.SetNewLocationForVersion(key, keyHash, location, version)
+	if err != nil {
+		return false, RecordMeta{}, err
+	}
+	if success {
+		if err := pht.writeToLog(key, meta); err != nil {
+			return false, RecordMeta{}, err
+		}
+	}
+	return success, meta, nil
+}
+
+func (pht *PersistentHashTable) Get(key Key, keyHash uint64) (RecordMeta, error) {
+	return pht.hashtable.Get(key, keyHash)
+}
+
+func (pht *PersistentHashTable) Sync() error {
+	if pht.shouldSync && pht.currentFile != nil {
+		err := pht.currentFile.Sync()
+		if err != nil {
+			return err
+		}
+		pht.shouldSync = false
+	}
+	return nil
+}
+
+func (pht *PersistentHashTable) Size() uint64 {
+	return pht.hashtable.Size()
 }
